@@ -127,7 +127,98 @@ struct magicmouse_sc {
 		u8 size;
 	} touches[16];
 	int tracking_ids[16];
+
+	struct power_supply_desc battery_desc;
+	struct power_supply *battery;
 };
+
+static enum power_supply_property magicmouse_battery_props[] = {
+	POWER_SUPPLY_PROP_STATUS,
+	POWER_SUPPLY_PROP_PRESENT,
+	POWER_SUPPLY_PROP_CAPACITY,
+	POWER_SUPPLY_PROP_SCOPE,
+};
+
+static int magicmouse_battery_get_property(struct power_supply *psy,
+					   enum power_supply_property psp,
+					   union power_supply_propval *val)
+{
+	struct magicmouse_sc *msc = power_supply_get_drvdata(psy);
+	uint8_t battery_capacity;
+	int battery_status;
+	// unsigned long flags;
+	int ret = 0;
+
+	/* TODO(JoseExposito) Get the real values */
+	/* TODO(JoseExposito) Add a lock and init it on probe: spin_lock_init(&msc->lock); */
+	printk(KERN_ALERT "@@@@@@@@@@@@@@@ magicmouse_battery_get_property: Returning hardcoded values\n");
+	battery_status = POWER_SUPPLY_STATUS_DISCHARGING;
+	battery_capacity = 70;
+
+	// spin_lock_irqsave(&dev->lock, flags);
+	// battery_capacity = dev->battery_capacity;
+	// battery_status = dev->battery_status;
+	// spin_unlock_irqrestore(&dev->lock, flags);
+	// -------------------------------------------------------------
+
+	switch (psp) {
+	case POWER_SUPPLY_PROP_STATUS:
+		val->intval = battery_status;
+		break;
+	case POWER_SUPPLY_PROP_PRESENT:
+		val->intval = 1;
+		break;
+	case POWER_SUPPLY_PROP_CAPACITY:
+		val->intval = battery_capacity;
+		break;
+	case POWER_SUPPLY_PROP_SCOPE:
+		val->intval = POWER_SUPPLY_SCOPE_DEVICE;
+		break;
+	default:
+		ret = -EINVAL;
+		break;
+	}
+
+	return ret;
+}
+
+static int magicmouse_battery_probe(struct hid_device *hdev)
+{
+
+	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
+	struct power_supply_config battery_cfg = { .drv_data = msc };
+	struct power_supply *battery = NULL;
+	int ret = 0;
+
+	printk(KERN_ALERT "@@@@@@@@@@@@@@@ magicmouse_battery_probe: Init\n");
+
+	msc->battery_desc.type = POWER_SUPPLY_TYPE_BATTERY;
+	msc->battery_desc.properties = magicmouse_battery_props;
+	msc->battery_desc.num_properties = ARRAY_SIZE(magicmouse_battery_props);
+	msc->battery_desc.get_property = magicmouse_battery_get_property;
+	msc->battery_desc.name = kasprintf(GFP_KERNEL, "magic_trackpad_2_%s",
+					     msc->input->uniq);
+	if (!msc->battery_desc.name)
+		return -ENOMEM;
+
+	battery = devm_power_supply_register(&hdev->dev,
+				&msc->battery_desc,
+				&battery_cfg);
+	if (IS_ERR(battery)) {
+		ret = PTR_ERR(battery);
+		hid_err(hdev, "Unable to register battery device: %d\n", ret);
+		return ret;
+	}
+	msc->battery = battery;
+
+	ret = power_supply_powers(msc->battery, &hdev->dev);
+	if (ret) {
+		hid_err(hdev, "Unable to activate battery device: %d\n", ret);
+		return ret;
+	}
+
+	return 0;
+}
 
 static int magicmouse_firm_touch(struct magicmouse_sc *msc)
 {
@@ -632,6 +723,13 @@ static int magicmouse_probe(struct hid_device *hdev,
 		report = hid_register_report(hdev, HID_INPUT_REPORT,
 			MOUSE_REPORT_ID, 0);
 	else if (id->product == USB_DEVICE_ID_APPLE_MAGICTRACKPAD2) {
+		/* TODO(JoseExposito) Should I ignore this error */
+		ret = magicmouse_battery_probe(hdev);
+		if (ret) {
+			hid_err(hdev, "magic trackpad 2 battery not registered\n");
+			goto err_stop_hw;
+		}
+
 		if (id->vendor == BT_VENDOR_ID_APPLE)
 			report = hid_register_report(hdev, HID_INPUT_REPORT,
 				TRACKPAD2_BT_REPORT_ID, 0);
