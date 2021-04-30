@@ -53,12 +53,9 @@ MODULE_PARM_DESC(report_undeciphered, "Report undeciphered multi-touch state fie
 #define TRACKPAD_REPORT_ID 0x28
 #define TRACKPAD2_USB_REPORT_ID 0x02
 #define TRACKPAD2_BT_REPORT_ID 0x31
+#define TRACKPAD2_BT_BATTERY_REPORT_ID 0x90
 #define MOUSE_REPORT_ID    0x29
 #define DOUBLE_REPORT_ID   0xf7
-
-#define TRACKPAD2_BATTERY_REPORT_ID 0x90
-#define TRACKPAD2_BATTERY_BT_REPORT_SIZE 2
-
 /* These definitions are not precise, but they're close enough.  (Bits
  * 0x03 seem to indicate the aspect ratio of the touch, bits 0x70 seem
  * to be some kind of bit mask -- 0x20 may be a near-field reading,
@@ -114,6 +111,8 @@ MODULE_PARM_DESC(report_undeciphered, "Report undeciphered multi-touch state fie
  * @scroll_jiffies: Time of last scroll motion.
  * @touches: Most recent data for a touch, indexed by tracking ID.
  * @tracking_ids: Mapping of current touch input data to @touches.
+ * @battery: Required data to report the battery status of the Apple Magic
+ * Trackpad 2. Battery is reported automatically on the Apple Magic Trackpad 1.
  */
 struct magicmouse_sc {
 	struct input_dev *input;
@@ -132,50 +131,54 @@ struct magicmouse_sc {
 	} touches[16];
 	int tracking_ids[16];
 
-	struct hid_device *hdev;
-	struct power_supply_desc battery_desc;
-	struct power_supply *battery;
-	int battery_capacity;
+	struct {
+		struct power_supply *ps;
+		struct power_supply_desc ps_desc;
+		int capacity;
+	} battery;
 };
 
-static enum power_supply_property magicmouse_battery_props[] = {
-	POWER_SUPPLY_PROP_STATUS,
+static enum power_supply_property magicmouse_ps_props[] = {
 	POWER_SUPPLY_PROP_PRESENT,
-	POWER_SUPPLY_PROP_CAPACITY,
 	POWER_SUPPLY_PROP_SCOPE,
+	POWER_SUPPLY_PROP_CAPACITY,
 };
 
-static int magicmouse_battery_get_capacity(struct magicmouse_sc *msc)
+static int magicmouse_battery_bt_get_capacity(struct magicmouse_sc *msc)
 {
+	struct hid_device *hdev = to_hid_device(msc->input->dev.parent);
 	struct hid_report *report;
 	int ret;
 
 	if (msc->input->id.product != USB_DEVICE_ID_APPLE_MAGICTRACKPAD2)
-		return 0;
+		return -EINVAL;
 
-	report = msc->hdev->report_enum[HID_INPUT_REPORT].
-		 report_id_hash[TRACKPAD2_BATTERY_REPORT_ID];
+	if (msc->input->id.vendor != BT_VENDOR_ID_APPLE)
+		return -EINVAL;
+
+	report = hdev->report_enum[HID_INPUT_REPORT].
+		 report_id_hash[TRACKPAD2_BT_BATTERY_REPORT_ID];
 
 	if (!report || report->maxfield < 1) {
-		hid_err(msc->hdev, "Failed to retrieve report with ID %d\n", TRACKPAD2_BATTERY_REPORT_ID);
+		hid_err(hdev, "failed to retrieve report with ID %d\n", TRACKPAD2_BT_BATTERY_REPORT_ID);
 		return -EINVAL;
 	}
 
-	hid_hw_request(msc->hdev, report, HID_REQ_GET_REPORT);
+	hid_hw_request(hdev, report, HID_REQ_GET_REPORT);
 
-	if (!report || report->maxfield < TRACKPAD2_BATTERY_BT_REPORT_SIZE) {
-		hid_err(msc->hdev, "Invalid report size, expected %d got %d\n", TRACKPAD2_BATTERY_BT_REPORT_SIZE, report->maxfield);
+	if (!report || report->maxfield < 2) {
+		hid_err(hdev, "invalid number of fields in the report, expected 2 got %d\n", report->maxfield);
 		return -EINVAL;
 	}
 
 	ret = report->field[0]->value[0];
 	if (ret < 0) {
-		hid_err(msc->hdev, "Invalid report status %d\n", ret);
+		hid_err(hdev, "invalid report status %d\n", ret);
 		return ret;
 	}
 
-	msc->battery_capacity = report->field[1]->value[0];
-	return ret;
+	msc->battery.capacity = report->field[1]->value[0];
+	return 0;
 }
 
 static int magicmouse_battery_get_property(struct power_supply *psy,
@@ -183,29 +186,23 @@ static int magicmouse_battery_get_property(struct power_supply *psy,
 					   union power_supply_propval *val)
 {
 	struct magicmouse_sc *msc = power_supply_get_drvdata(psy);
-	int battery_status;
 	int ret = 0;
 
 	if (msc->input->id.product != USB_DEVICE_ID_APPLE_MAGICTRACKPAD2)
-		return 0;
-
-	/* TODO(JoseExposito) Get the real value */
-	battery_status = POWER_SUPPLY_STATUS_DISCHARGING;
+		return -EINVAL;
 
 	switch (psp) {
-	case POWER_SUPPLY_PROP_STATUS:
-		val->intval = battery_status;
-		break;
 	case POWER_SUPPLY_PROP_PRESENT:
 		val->intval = 1;
 		break;
-	case POWER_SUPPLY_PROP_CAPACITY:
-		magicmouse_battery_get_capacity(msc);
-		val->intval = msc->battery_capacity;
-		printk(KERN_ALERT "@@@@@@@@@@@@@@@ Battery capacity: %d\n", msc->battery_capacity);
-		break;
 	case POWER_SUPPLY_PROP_SCOPE:
 		val->intval = POWER_SUPPLY_SCOPE_DEVICE;
+		break;
+	case POWER_SUPPLY_PROP_CAPACITY:
+		if (msc->input->id.vendor == BT_VENDOR_ID_APPLE)
+			magicmouse_battery_bt_get_capacity(msc);
+
+		val->intval = msc->battery.capacity;
 		break;
 	default:
 		ret = -EINVAL;
@@ -217,36 +214,42 @@ static int magicmouse_battery_get_property(struct power_supply *psy,
 
 static int magicmouse_battery_probe(struct hid_device *hdev)
 {
-
 	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
-	struct power_supply_config battery_cfg = { .drv_data = msc };
-	struct power_supply *battery = NULL;
-	int ret = 0;
+	struct power_supply *ps = NULL;
+	struct power_supply_config ps_cfg = { .drv_data = msc };
+	int ret;
 
-	printk(KERN_ALERT "@@@@@@@@@@@@@@@ magicmouse_battery_probe: Init\n");
+	if (msc->input->id.product != USB_DEVICE_ID_APPLE_MAGICTRACKPAD2)
+		return -EINVAL;
 
-	msc->battery_desc.type = POWER_SUPPLY_TYPE_BATTERY;
-	msc->battery_desc.properties = magicmouse_battery_props;
-	msc->battery_desc.num_properties = ARRAY_SIZE(magicmouse_battery_props);
-	msc->battery_desc.get_property = magicmouse_battery_get_property;
-	msc->battery_desc.name = kasprintf(GFP_KERNEL, "magic_trackpad_2_%s",
-					     msc->input->uniq);
-	if (!msc->battery_desc.name)
+	if (msc->input->id.vendor != BT_VENDOR_ID_APPLE)
+		return -EINVAL;
+
+	msc->battery.capacity = 100;
+	msc->battery.ps_desc.type = POWER_SUPPLY_TYPE_BATTERY;
+	msc->battery.ps_desc.properties = magicmouse_ps_props;
+	msc->battery.ps_desc.num_properties = ARRAY_SIZE(magicmouse_ps_props);
+	msc->battery.ps_desc.get_property = magicmouse_battery_get_property;
+	msc->battery.ps_desc.name = kasprintf(GFP_KERNEL, "magic_trackpad_2_%s",
+					      msc->input->uniq);
+	if (!msc->battery.ps_desc.name) {
+		hid_err(hdev, "unable to register battery device name, ENOMEM\n");
 		return -ENOMEM;
+	}
 
-	battery = devm_power_supply_register(&hdev->dev,
-				&msc->battery_desc,
-				&battery_cfg);
-	if (IS_ERR(battery)) {
-		ret = PTR_ERR(battery);
-		hid_err(hdev, "Unable to register battery device: %d\n", ret);
+	ps = devm_power_supply_register(&hdev->dev, &msc->battery.ps_desc,
+					&ps_cfg);
+	if (IS_ERR(ps)) {
+		ret = PTR_ERR(ps);
+		hid_err(hdev, "unable to register battery device: %d\n", ret);
 		return ret;
 	}
-	msc->battery = battery;
 
-	ret = power_supply_powers(msc->battery, &hdev->dev);
+	msc->battery.ps = ps;
+
+	ret = power_supply_powers(msc->battery.ps, &hdev->dev);
 	if (ret) {
-		hid_err(hdev, "Unable to activate battery device: %d\n", ret);
+		hid_err(hdev, "unable to activate battery device: %d\n", ret);
 		return ret;
 	}
 
@@ -729,9 +732,7 @@ static int magicmouse_probe(struct hid_device *hdev,
 		return -ENOMEM;
 	}
 
-	msc->hdev = hdev;
 	msc->scroll_accel = SCROLL_ACCEL_DEFAULT;
-	msc->battery_capacity = 100;
 
 	msc->quirks = id->driver_data;
 	hid_set_drvdata(hdev, msc);
@@ -758,11 +759,14 @@ static int magicmouse_probe(struct hid_device *hdev,
 		report = hid_register_report(hdev, HID_INPUT_REPORT,
 			MOUSE_REPORT_ID, 0);
 	else if (id->product == USB_DEVICE_ID_APPLE_MAGICTRACKPAD2) {
-		/* TODO(JoseExposito) Should I ignore this error */
 		ret = magicmouse_battery_probe(hdev);
 		if (ret) {
 			hid_err(hdev, "magic trackpad 2 battery not registered\n");
-			goto err_stop_hw;
+			/*
+			 * Ignore this error. There is not need to stop the
+			 * device because it will work without reporting its
+			 * battery status.
+			 */
 		}
 
 		if (id->vendor == BT_VENDOR_ID_APPLE)
