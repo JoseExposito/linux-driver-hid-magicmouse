@@ -16,6 +16,7 @@
 #include <linux/input/mt.h>
 #include <linux/module.h>
 #include <linux/slab.h>
+#include <linux/usb.h>
 
 #include "hid-ids.h"
 
@@ -52,6 +53,7 @@ MODULE_PARM_DESC(report_undeciphered, "Report undeciphered multi-touch state fie
 
 #define TRACKPAD_REPORT_ID 0x28
 #define TRACKPAD2_USB_REPORT_ID 0x02
+#define TRACKPAD2_USB_BATTERY_EP_ADDR 0x81
 #define TRACKPAD2_BT_REPORT_ID 0x31
 #define TRACKPAD2_BT_BATTERY_REPORT_ID 0x90
 #define MOUSE_REPORT_ID    0x29
@@ -135,6 +137,10 @@ struct magicmouse_sc {
 		struct power_supply *ps;
 		struct power_supply_desc ps_desc;
 		int capacity;
+		struct urb *urb;
+		u8 *urb_buf;
+		int urb_buf_size;
+		dma_addr_t urb_buf_dma;
 	} battery;
 };
 
@@ -150,10 +156,8 @@ static int magicmouse_battery_bt_get_capacity(struct magicmouse_sc *msc)
 	struct hid_report *report;
 	int ret;
 
-	if (msc->input->id.product != USB_DEVICE_ID_APPLE_MAGICTRACKPAD2)
-		return -EINVAL;
-
-	if (msc->input->id.vendor != BT_VENDOR_ID_APPLE)
+	if (msc->input->id.product != USB_DEVICE_ID_APPLE_MAGICTRACKPAD2 ||
+	    msc->input->id.vendor != BT_VENDOR_ID_APPLE)
 		return -EINVAL;
 
 	report = hdev->report_enum[HID_INPUT_REPORT].
@@ -212,6 +216,115 @@ static int magicmouse_battery_get_property(struct power_supply *psy,
 	return ret;
 }
 
+static void magicmouse_battery_usb_urb_complete(struct urb *urb)
+{
+	struct magicmouse_sc *msc = urb->context;
+	struct hid_device *hdev = to_hid_device(msc->input->dev.parent);
+	int ret;
+
+	switch (urb->status) {
+	case 0:
+		msc->battery.capacity = msc->battery.urb_buf[2];
+		break;
+	case -EOVERFLOW:
+		hid_err(hdev, "URB overflow\n");
+		fallthrough;
+	case -ECONNRESET:
+	case -ENOENT:
+	case -ESHUTDOWN:
+		hid_dbg(hdev, "URB shuttingdown with status: %d\n", urb->status);
+		return;
+	default:
+		hid_dbg(hdev, "nonzero URB status received: %d\n", urb->status);
+		break;
+	}
+
+	ret = usb_submit_urb(msc->battery.urb, GFP_ATOMIC);
+	if (ret)
+		hid_err(hdev, "unable to submit URB, %d\n", ret);
+}
+
+static int magicmouse_battery_usb_probe(struct magicmouse_sc *msc)
+{
+	struct hid_device *hdev = to_hid_device(msc->input->dev.parent);
+	struct usb_interface *iface = to_usb_interface(hdev->dev.parent);
+	struct usb_device *usbdev = interface_to_usbdev(iface);
+	struct usb_host_endpoint *endpoint = NULL;
+	unsigned int pipe = 0;
+	int i, ret;
+
+	if (msc->input->id.product != USB_DEVICE_ID_APPLE_MAGICTRACKPAD2 ||
+	    msc->input->id.vendor != USB_VENDOR_ID_APPLE)
+		return -EINVAL;
+
+	for (i = 0; i < sizeof(usbdev->ep_in); i++) {
+		endpoint = usbdev->ep_in[i];
+		if (endpoint &&
+		    endpoint->desc.bEndpointAddress == TRACKPAD2_USB_BATTERY_EP_ADDR) {
+			/* Endpoint found*/
+			break;
+		}
+	}
+
+	if (!endpoint) {
+		hid_err(hdev, "endpoint with address %d not found\n", TRACKPAD2_USB_BATTERY_EP_ADDR);
+		ret = -EIO;
+		goto exit;
+	}
+
+	msc->battery.urb = usb_alloc_urb(0, GFP_ATOMIC);
+	if (!msc->battery.urb) {
+		hid_err(hdev, "unable to alloc URB, ENOMEM\n");
+		ret = -ENOMEM;
+		goto exit;
+	}
+
+	pipe = usb_rcvintpipe(usbdev, endpoint->desc.bEndpointAddress);
+	if (pipe == 0) {
+		hid_err(hdev, "unable to create USB receive interrupt pipe\n");
+		ret = -EIO;
+		goto err_free_urb;
+	}
+
+	msc->battery.urb_buf_size = endpoint->desc.wMaxPacketSize;
+	msc->battery.urb_buf_dma = msc->battery.urb->transfer_dma;
+	msc->battery.urb_buf = usb_alloc_coherent(usbdev,
+			       msc->battery.urb_buf_size, GFP_ATOMIC,
+			       &msc->battery.urb_buf_dma);
+	if (!msc->battery.urb_buf) {
+		hid_err(hdev, "unable to alloc URB buffer, ENOMEM\n");
+		ret = -ENOMEM;
+		goto err_free_urb;
+	}
+
+	usb_fill_int_urb(msc->battery.urb, usbdev, pipe, msc->battery.urb_buf,
+			 msc->battery.urb_buf_size,
+			 magicmouse_battery_usb_urb_complete, msc,
+			 endpoint->desc.bInterval);
+
+	ret = usb_submit_urb(msc->battery.urb, GFP_ATOMIC);
+	if (ret) {
+		hid_err(hdev, "unable to submit URB, %d\n", ret);
+		goto err_free_urb_buf;
+	}
+
+	return 0;
+
+err_free_urb_buf:
+	usb_free_coherent(usbdev, msc->battery.urb_buf_size,
+			  msc->battery.urb_buf, msc->battery.urb_buf_dma);
+
+err_free_urb:
+	usb_free_urb(msc->battery.urb);
+
+exit:
+	msc->battery.urb = NULL;
+	msc->battery.urb_buf = NULL;
+	msc->battery.urb_buf_size = 0;
+
+	return ret;
+}
+
 static int magicmouse_battery_probe(struct hid_device *hdev)
 {
 	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
@@ -220,9 +333,6 @@ static int magicmouse_battery_probe(struct hid_device *hdev)
 	int ret;
 
 	if (msc->input->id.product != USB_DEVICE_ID_APPLE_MAGICTRACKPAD2)
-		return -EINVAL;
-
-	if (msc->input->id.vendor != BT_VENDOR_ID_APPLE)
 		return -EINVAL;
 
 	msc->battery.capacity = 100;
@@ -251,6 +361,12 @@ static int magicmouse_battery_probe(struct hid_device *hdev)
 	if (ret) {
 		hid_err(hdev, "unable to activate battery device: %d\n", ret);
 		return ret;
+	}
+
+	if (msc->input->id.vendor == USB_VENDOR_ID_APPLE) {
+		ret = magicmouse_battery_usb_probe(msc);
+		if (ret)
+			return ret;
 	}
 
 	return 0;
@@ -830,6 +946,31 @@ err_stop_hw:
 	return ret;
 }
 
+static void magicmouse_remove(struct hid_device *hdev)
+{
+	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
+	struct usb_interface *iface;
+	struct usb_device *usbdev;
+
+	hid_hw_stop(hdev);
+
+	if (msc &&
+	    msc->input->id.product == USB_DEVICE_ID_APPLE_MAGICTRACKPAD2 &&
+	    msc->input->id.vendor == USB_VENDOR_ID_APPLE &&
+	    msc->battery.urb && msc->battery.urb_buf) {
+		iface = to_usb_interface(hdev->dev.parent);
+		usbdev = interface_to_usbdev(iface);
+
+		usb_kill_urb(msc->battery.urb);
+
+		usb_free_coherent(usbdev, msc->battery.urb_buf_size,
+				  msc->battery.urb_buf,
+				  msc->battery.urb_buf_dma);
+
+		usb_free_urb(msc->battery.urb);
+	}
+}
+
 static const struct hid_device_id magic_mice[] = {
 	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_APPLE,
 		USB_DEVICE_ID_APPLE_MAGICMOUSE), .driver_data = 0 },
@@ -850,6 +991,7 @@ static struct hid_driver magicmouse_driver = {
 	.raw_event = magicmouse_raw_event,
 	.input_mapping = magicmouse_input_mapping,
 	.input_configured = magicmouse_input_configured,
+	.remove	= magicmouse_remove,
 };
 module_hid_driver(magicmouse_driver);
 
