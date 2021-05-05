@@ -154,6 +154,7 @@ static enum power_supply_property magicmouse_ps_props[] = {
 static int magicmouse_battery_bt_get_capacity(struct magicmouse_sc *msc)
 {
 	struct hid_device *hdev = to_hid_device(msc->input->dev.parent);
+	struct hid_report_enum report_enum;
 	struct hid_report *report;
 	int ret;
 
@@ -161,18 +162,20 @@ static int magicmouse_battery_bt_get_capacity(struct magicmouse_sc *msc)
 	    msc->input->id.vendor != BT_VENDOR_ID_APPLE)
 		return -EINVAL;
 
-	report = hdev->report_enum[HID_INPUT_REPORT].
-		 report_id_hash[TRACKPAD2_BT_BATTERY_REPORT_ID];
+	report_enum = hdev->report_enum[HID_INPUT_REPORT];
+	report = report_enum.report_id_hash[TRACKPAD2_BT_BATTERY_REPORT_ID];
 
 	if (!report || report->maxfield < 1) {
-		hid_err(hdev, "failed to retrieve report with ID %d\n", TRACKPAD2_BT_BATTERY_REPORT_ID);
+		hid_err(hdev, "failed to retrieve report with ID %d\n",
+			TRACKPAD2_BT_BATTERY_REPORT_ID);
 		return -EINVAL;
 	}
 
 	hid_hw_request(hdev, report, HID_REQ_GET_REPORT);
 
 	if (!report || report->maxfield < 2) {
-		hid_err(hdev, "invalid number of fields in the report, expected 2 got %d\n", report->maxfield);
+		hid_err(hdev, "invalid number of fields in the report: %d\n",
+			report->maxfield);
 		return -EINVAL;
 	}
 
@@ -242,7 +245,7 @@ static void magicmouse_battery_usb_urb_complete(struct urb *urb)
 	case -ECONNRESET:
 	case -ENOENT:
 	case -ESHUTDOWN:
-		hid_dbg(hdev, "URB shuttingdown with status: %d\n", urb->status);
+		hid_dbg(hdev, "URB shuttingdown with status %d\n", urb->status);
 		return;
 	default:
 		hid_dbg(hdev, "nonzero URB status received: %d\n", urb->status);
@@ -260,6 +263,7 @@ static int magicmouse_battery_usb_probe(struct magicmouse_sc *msc)
 	struct usb_interface *iface = to_usb_interface(hdev->dev.parent);
 	struct usb_device *usbdev = interface_to_usbdev(iface);
 	struct usb_host_endpoint *endpoint = NULL;
+	u8 ep_address;
 	unsigned int pipe = 0;
 	int i, ret;
 
@@ -269,15 +273,16 @@ static int magicmouse_battery_usb_probe(struct magicmouse_sc *msc)
 
 	for (i = 0; i < sizeof(usbdev->ep_in); i++) {
 		endpoint = usbdev->ep_in[i];
-		if (endpoint &&
-		    endpoint->desc.bEndpointAddress == TRACKPAD2_USB_BATTERY_EP_ADDR) {
-			/* Endpoint found*/
-			break;
+		if (endpoint) {
+			ep_address = endpoint->desc.bEndpointAddress;
+			if (ep_address == TRACKPAD2_USB_BATTERY_EP_ADDR)
+				break;
 		}
 	}
 
 	if (!endpoint) {
-		hid_err(hdev, "endpoint with address %d not found\n", TRACKPAD2_USB_BATTERY_EP_ADDR);
+		hid_err(hdev, "endpoint with address %d not found\n",
+			TRACKPAD2_USB_BATTERY_EP_ADDR);
 		ret = -EIO;
 		goto exit;
 	}
@@ -353,7 +358,7 @@ static int magicmouse_battery_probe(struct hid_device *hdev)
 	msc->battery.ps_desc.name = kasprintf(GFP_KERNEL, "magic_trackpad_2_%s",
 					      msc->input->uniq);
 	if (!msc->battery.ps_desc.name) {
-		hid_err(hdev, "unable to register battery device name, ENOMEM\n");
+		hid_err(hdev, "unable to register ps_desc name, ENOMEM\n");
 		return -ENOMEM;
 	}
 
