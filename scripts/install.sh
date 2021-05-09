@@ -12,14 +12,14 @@ DIR="$( cd "$( dirname "${BASH_SOURCE[0]}" )" && pwd )"
 
 # compile
 echo "------------ COMPILING SOURCE CODE ------------"
-cd ${DIR}/../linux/drivers/hid
+cd ${DIR}/../drivers/hid
 make clean
 make all
 
 # add
 echo "------------ ADDING DKMS MODULE ------------"
 if ! dkms status -m $dkms_name -v $dkms_version | egrep '(added|built|installed)' >/dev/null ; then
-  dkms add ${DIR}/../linux/drivers/hid
+  dkms add ${DIR}/../drivers/hid
 fi
 
 # build
