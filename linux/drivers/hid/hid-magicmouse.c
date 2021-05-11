@@ -1063,7 +1063,9 @@ static void magicmouse_remove(struct hid_device *hdev)
 	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
 	struct usb_interface *iface;
 	struct usb_device *usbdev;
-	cancel_delayed_work_sync(&msc->work);
+
+	if (msc)
+		cancel_delayed_work_sync(&msc->work);
 
 	if (msc &&
 	    magicmouse_can_report_battery_vendor(msc, USB_VENDOR_ID_APPLE) &&
