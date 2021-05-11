@@ -17,6 +17,7 @@
 #include <linux/module.h>
 #include <linux/slab.h>
 #include <linux/usb.h>
+#include <linux/workqueue.h>
 
 #include "hid-ids.h"
 
@@ -53,11 +54,13 @@ MODULE_PARM_DESC(report_undeciphered, "Report undeciphered multi-touch state fie
 
 #define TRACKPAD_REPORT_ID 0x28
 #define TRACKPAD2_USB_REPORT_ID 0x02
-#define TRACKPAD2_USB_BATTERY_EP_ADDR 0x81
 #define TRACKPAD2_BT_REPORT_ID 0x31
-#define TRACKPAD2_BT_BATTERY_REPORT_ID 0x90
 #define MOUSE_REPORT_ID    0x29
+#define MOUSE2_REPORT_ID   0x12
 #define DOUBLE_REPORT_ID   0xf7
+#define BT_BATTERY_REPORT_ID 0x90
+#define USB_BATTERY_EP_ADDR  0x81
+
 /* These definitions are not precise, but they're close enough.  (Bits
  * 0x03 seem to indicate the aspect ratio of the touch, bits 0x70 seem
  * to be some kind of bit mask -- 0x20 may be a near-field reading,
@@ -114,7 +117,8 @@ MODULE_PARM_DESC(report_undeciphered, "Report undeciphered multi-touch state fie
  * @touches: Most recent data for a touch, indexed by tracking ID.
  * @tracking_ids: Mapping of current touch input data to @touches.
  * @battery: Required data to report the battery status of the Apple Magic
- * Trackpad 2. Battery is reported automatically on the Apple Magic Trackpad 1.
+ * Mouse 2 and Apple Magic Trackpad 2. Battery is reported automatically on the
+ * first generation of the devices.
  */
 struct magicmouse_sc {
 	struct input_dev *input;
@@ -132,6 +136,9 @@ struct magicmouse_sc {
 		u8 size;
 	} touches[16];
 	int tracking_ids[16];
+
+	struct hid_device *hdev;
+	struct delayed_work work;
 
 	struct {
 		struct power_supply *ps;
@@ -151,37 +158,48 @@ static enum power_supply_property magicmouse_ps_props[] = {
 	POWER_SUPPLY_PROP_STATUS,
 };
 
+static bool magicmouse_can_report_battery(struct magicmouse_sc *msc)
+{
+	return (msc->input->id.product == USB_DEVICE_ID_APPLE_MAGICTRACKPAD2) ||
+	       (msc->input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE2);
+}
+
+static bool magicmouse_can_report_battery_vendor(struct magicmouse_sc *msc,
+						 unsigned short vendor)
+{
+	return magicmouse_can_report_battery(msc) &&
+	       (msc->input->id.vendor == vendor);
+}
+
 static int magicmouse_battery_bt_get_capacity(struct magicmouse_sc *msc)
 {
-	struct hid_device *hdev = to_hid_device(msc->input->dev.parent);
 	struct hid_report_enum report_enum;
 	struct hid_report *report;
 	int ret;
 
-	if (msc->input->id.product != USB_DEVICE_ID_APPLE_MAGICTRACKPAD2 ||
-	    msc->input->id.vendor != BT_VENDOR_ID_APPLE)
+	if (!magicmouse_can_report_battery_vendor(msc, BT_VENDOR_ID_APPLE))
 		return -EINVAL;
 
-	report_enum = hdev->report_enum[HID_INPUT_REPORT];
-	report = report_enum.report_id_hash[TRACKPAD2_BT_BATTERY_REPORT_ID];
+	report_enum = msc->hdev->report_enum[HID_INPUT_REPORT];
+	report = report_enum.report_id_hash[BT_BATTERY_REPORT_ID];
 
 	if (!report || report->maxfield < 1) {
-		hid_err(hdev, "failed to retrieve report with ID %d\n",
-			TRACKPAD2_BT_BATTERY_REPORT_ID);
+		hid_err(msc->hdev, "failed to retrieve report with ID %d\n",
+			BT_BATTERY_REPORT_ID);
 		return -EINVAL;
 	}
 
-	hid_hw_request(hdev, report, HID_REQ_GET_REPORT);
+	hid_hw_request(msc->hdev, report, HID_REQ_GET_REPORT);
 
 	if (!report || report->maxfield < 2) {
-		hid_err(hdev, "invalid number of fields in the report: %d\n",
+		hid_err(msc->hdev, "invalid report->maxfield: %d\n",
 			report->maxfield);
 		return -EINVAL;
 	}
 
 	ret = report->field[0]->value[0];
 	if (ret < 0) {
-		hid_err(hdev, "invalid report status %d\n", ret);
+		hid_err(msc->hdev, "invalid report status %d\n", ret);
 		return ret;
 	}
 
@@ -196,7 +214,7 @@ static int magicmouse_battery_get_property(struct power_supply *psy,
 	struct magicmouse_sc *msc = power_supply_get_drvdata(psy);
 	int ret = 0;
 
-	if (msc->input->id.product != USB_DEVICE_ID_APPLE_MAGICTRACKPAD2)
+	if (!magicmouse_can_report_battery(msc))
 		return -EINVAL;
 
 	switch (psp) {
@@ -232,7 +250,6 @@ static int magicmouse_battery_get_property(struct power_supply *psy,
 static void magicmouse_battery_usb_urb_complete(struct urb *urb)
 {
 	struct magicmouse_sc *msc = urb->context;
-	struct hid_device *hdev = to_hid_device(msc->input->dev.parent);
 	int ret;
 
 	switch (urb->status) {
@@ -240,63 +257,59 @@ static void magicmouse_battery_usb_urb_complete(struct urb *urb)
 		msc->battery.capacity = msc->battery.urb_buf[2];
 		break;
 	case -EOVERFLOW:
-		hid_err(hdev, "URB overflow\n");
+		hid_err(msc->hdev, "URB overflow\n");
 		fallthrough;
 	case -ECONNRESET:
 	case -ENOENT:
 	case -ESHUTDOWN:
-		hid_dbg(hdev, "URB shuttingdown with status %d\n", urb->status);
 		return;
 	default:
-		hid_dbg(hdev, "nonzero URB status received: %d\n", urb->status);
 		break;
 	}
 
 	ret = usb_submit_urb(msc->battery.urb, GFP_ATOMIC);
 	if (ret)
-		hid_err(hdev, "unable to submit URB, %d\n", ret);
+		hid_err(msc->hdev, "unable to submit URB, %d\n", ret);
 }
 
 static int magicmouse_battery_usb_probe(struct magicmouse_sc *msc)
 {
-	struct hid_device *hdev = to_hid_device(msc->input->dev.parent);
-	struct usb_interface *iface = to_usb_interface(hdev->dev.parent);
+	struct usb_interface *iface = to_usb_interface(msc->hdev->dev.parent);
 	struct usb_device *usbdev = interface_to_usbdev(iface);
 	struct usb_host_endpoint *endpoint = NULL;
 	u8 ep_address;
 	unsigned int pipe = 0;
 	int i, ret;
 
-	if (msc->input->id.product != USB_DEVICE_ID_APPLE_MAGICTRACKPAD2 ||
-	    msc->input->id.vendor != USB_VENDOR_ID_APPLE)
+	if (!magicmouse_can_report_battery_vendor(msc, USB_VENDOR_ID_APPLE))
 		return -EINVAL;
 
 	for (i = 0; i < sizeof(usbdev->ep_in); i++) {
 		endpoint = usbdev->ep_in[i];
 		if (endpoint) {
 			ep_address = endpoint->desc.bEndpointAddress;
-			if (ep_address == TRACKPAD2_USB_BATTERY_EP_ADDR)
+			if (ep_address == USB_BATTERY_EP_ADDR)
 				break;
 		}
 	}
 
 	if (!endpoint) {
-		hid_err(hdev, "endpoint with address %d not found\n",
-			TRACKPAD2_USB_BATTERY_EP_ADDR);
+		hid_err(msc->hdev, "endpoint with address %d not found\n",
+			USB_BATTERY_EP_ADDR);
 		ret = -EIO;
 		goto exit;
 	}
 
 	msc->battery.urb = usb_alloc_urb(0, GFP_ATOMIC);
 	if (!msc->battery.urb) {
-		hid_err(hdev, "unable to alloc URB, ENOMEM\n");
+		hid_err(msc->hdev, "unable to alloc URB, ENOMEM\n");
 		ret = -ENOMEM;
 		goto exit;
 	}
 
 	pipe = usb_rcvintpipe(usbdev, endpoint->desc.bEndpointAddress);
 	if (pipe == 0) {
-		hid_err(hdev, "unable to create USB receive interrupt pipe\n");
+		hid_err(msc->hdev, "unable to create USB rcvintpipe\n");
 		ret = -EIO;
 		goto err_free_urb;
 	}
@@ -307,7 +320,7 @@ static int magicmouse_battery_usb_probe(struct magicmouse_sc *msc)
 			       msc->battery.urb_buf_size, GFP_ATOMIC,
 			       &msc->battery.urb_buf_dma);
 	if (!msc->battery.urb_buf) {
-		hid_err(hdev, "unable to alloc URB buffer, ENOMEM\n");
+		hid_err(msc->hdev, "unable to alloc URB buffer, ENOMEM\n");
 		ret = -ENOMEM;
 		goto err_free_urb;
 	}
@@ -319,7 +332,7 @@ static int magicmouse_battery_usb_probe(struct magicmouse_sc *msc)
 
 	ret = usb_submit_urb(msc->battery.urb, GFP_ATOMIC);
 	if (ret) {
-		hid_err(hdev, "unable to submit URB, %d\n", ret);
+		hid_err(msc->hdev, "unable to submit URB, %d\n", ret);
 		goto err_free_urb_buf;
 	}
 
@@ -347,8 +360,8 @@ static int magicmouse_battery_probe(struct hid_device *hdev)
 	struct power_supply_config ps_cfg = { .drv_data = msc };
 	int ret;
 
-	if (msc->input->id.product != USB_DEVICE_ID_APPLE_MAGICTRACKPAD2)
-		return -EINVAL;
+	if (!magicmouse_can_report_battery(msc))
+		return 0;
 
 	msc->battery.capacity = 100;
 	msc->battery.ps_desc.type = POWER_SUPPLY_TYPE_BATTERY;
@@ -453,7 +466,8 @@ static void magicmouse_emit_touch(struct magicmouse_sc *msc, int raw_id, u8 *tda
 	int id, x, y, size, orientation, touch_major, touch_minor, state, down;
 	int pressure = 0;
 
-	if (input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE) {
+	if (input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE ||
+	    input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE2) {
 		id = (tdata[6] << 2 | tdata[5] >> 6) & 0xf;
 		x = (tdata[1] << 28 | tdata[0] << 20) >> 20;
 		y = -((tdata[2] << 24 | tdata[1] << 16) >> 20);
@@ -554,7 +568,8 @@ static void magicmouse_emit_touch(struct magicmouse_sc *msc, int raw_id, u8 *tda
 			input_report_abs(input, ABS_MT_PRESSURE, pressure);
 
 		if (report_undeciphered) {
-			if (input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE)
+			if (input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE ||
+			    input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE2)
 				input_event(input, EV_MSC, MSC_RAW, tdata[7]);
 			else if (input->id.product !=
 					USB_DEVICE_ID_APPLE_MAGICTRACKPAD2)
@@ -638,6 +653,34 @@ static int magicmouse_raw_event(struct hid_device *hdev,
 		 * ts = data[3] >> 6 | data[4] << 2 | data[5] << 10;
 		 */
 		break;
+	case MOUSE2_REPORT_ID:
+		/* Size is either 8 or (14 + 8 * N) */
+		if (size != 8 && (size < 14 || (size - 14) % 8 != 0))
+			return 0;
+		npoints = (size - 14) / 8;
+		if (npoints > 15) {
+			hid_warn(hdev, "invalid size value (%d) for MOUSE2_REPORT_ID\n",
+					size);
+			return 0;
+		}
+		msc->ntouches = 0;
+		for (ii = 0; ii < npoints; ii++)
+			magicmouse_emit_touch(msc, ii, data + ii * 8 + 14);
+
+		/* When emulating three-button mode, it is important
+		 * to have the current touch information before
+		 * generating a click event.
+		 */
+		x = (int)((data[3] << 24) | (data[2] << 16)) >> 16;
+		y = (int)((data[5] << 24) | (data[4] << 16)) >> 16;
+		clicks = data[1];
+
+		/* The following bits provide a device specific timestamp. They
+		 * are unused here.
+		 *
+		 * ts = data[11] >> 6 | data[12] << 2 | data[13] << 10;
+		 */
+		break;
 	case DOUBLE_REPORT_ID:
 		/* Sometimes the trackpad sends two touch reports in one
 		 * packet.
@@ -650,7 +693,8 @@ static int magicmouse_raw_event(struct hid_device *hdev,
 		return 0;
 	}
 
-	if (input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE) {
+	if (input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE ||
+	    input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE2) {
 		magicmouse_emit_buttons(msc, clicks & 3);
 		input_report_rel(input, REL_X, x);
 		input_report_rel(input, REL_Y, y);
@@ -666,6 +710,23 @@ static int magicmouse_raw_event(struct hid_device *hdev,
 	return 1;
 }
 
+static int magicmouse_event(struct hid_device *hdev, struct hid_field *field,
+		struct hid_usage *usage, __s32 value)
+{
+	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
+	if (msc->input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE2 &&
+	    field->report->id == MOUSE2_REPORT_ID) {
+		/*
+		 * magic_mouse_raw_event has done all the work. Skip hidinput.
+		 *
+		 * Specifically, hidinput may modify BTN_LEFT and BTN_RIGHT,
+		 * breaking emulate_3button.
+		 */
+		return 1;
+	}
+	return 0;
+}
+
 static int magicmouse_setup_input(struct input_dev *input, struct hid_device *hdev)
 {
 	int error;
@@ -673,7 +734,8 @@ static int magicmouse_setup_input(struct input_dev *input, struct hid_device *hd
 
 	__set_bit(EV_KEY, input->evbit);
 
-	if (input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE) {
+	if (input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE ||
+	    input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE2) {
 		__set_bit(BTN_LEFT, input->keybit);
 		__set_bit(BTN_RIGHT, input->keybit);
 		if (emulate_3button)
@@ -738,7 +800,8 @@ static int magicmouse_setup_input(struct input_dev *input, struct hid_device *hd
 	 * the origin at the same position, and just uses the additive
 	 * inverse of the reported Y.
 	 */
-	if (input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE) {
+	if (input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE ||
+	    input->id.product == USB_DEVICE_ID_APPLE_MAGICMOUSE2) {
 		input_set_abs_params(input, ABS_MT_ORIENTATION, -31, 32, 1, 0);
 		input_set_abs_params(input, ABS_MT_POSITION_X,
 				     MOUSE_MIN_X, MOUSE_MAX_X, 4, 0);
@@ -838,22 +901,73 @@ static int magicmouse_input_configured(struct hid_device *hdev,
 	return 0;
 }
 
+static int magicmouse_enable_multitouch(struct hid_device *hdev)
+{
+	const u8 *feature;
+	const u8 feature_mt[] = { 0xD7, 0x01 };
+	const u8 feature_mt_mouse2[] = { 0xF1, 0x02, 0x01 };
+	const u8 feature_mt_trackpad2_usb[] = { 0x02, 0x01 };
+	const u8 feature_mt_trackpad2_bt[] = { 0xF1, 0x02, 0x01 };
+	u8 *buf;
+	int ret;
+	int feature_size;
+
+	if (hdev->product == USB_DEVICE_ID_APPLE_MAGICTRACKPAD2) {
+		if (hdev->vendor == BT_VENDOR_ID_APPLE) {
+			feature_size = sizeof(feature_mt_trackpad2_bt);
+			feature = feature_mt_trackpad2_bt;
+		} else { /* USB_VENDOR_ID_APPLE */
+			feature_size = sizeof(feature_mt_trackpad2_usb);
+			feature = feature_mt_trackpad2_usb;
+		}
+	} else if (hdev->product == USB_DEVICE_ID_APPLE_MAGICMOUSE2) {
+		if (hdev->vendor == BT_VENDOR_ID_APPLE) {
+			feature_size = sizeof(feature_mt_mouse2);
+			feature = feature_mt_mouse2;
+		} else { /* USB_VENDOR_ID_APPLE */
+			/*
+			 * The Magic Mouse 2 has the lightning connector on the
+			 * bottom, making impossible to use it when it is
+			 * charging.
+			 */
+			return 0;
+		}
+	} else {
+		feature_size = sizeof(feature_mt);
+		feature = feature_mt;
+	}
+
+	buf = kmemdup(feature, feature_size, GFP_KERNEL);
+	if (!buf)
+		return -ENOMEM;
+
+	ret = hid_hw_raw_request(hdev, buf[0], buf, feature_size,
+				HID_FEATURE_REPORT, HID_REQ_SET_REPORT);
+	kfree(buf);
+	return ret;
+}
+
+static void magicmouse_enable_mt_work(struct work_struct *work)
+{
+	struct magicmouse_sc *msc =
+		container_of(work, struct magicmouse_sc, work.work);
+	int ret;
+
+	ret = magicmouse_enable_multitouch(msc->hdev);
+	if (ret < 0)
+		hid_err(msc->hdev, "unable to request touch data (%d)\n", ret);
+}
 
 static int magicmouse_probe(struct hid_device *hdev,
 	const struct hid_device_id *id)
 {
-	const u8 *feature;
-	const u8 feature_mt[] = { 0xD7, 0x01 };
-	const u8 feature_mt_trackpad2_usb[] = { 0x02, 0x01 };
-	const u8 feature_mt_trackpad2_bt[] = { 0xF1, 0x02, 0x01 };
-	u8 *buf;
 	struct magicmouse_sc *msc;
 	struct hid_report *report;
 	int ret;
-	int feature_size;
 
 	if (id->vendor == USB_VENDOR_ID_APPLE &&
-	    id->product == USB_DEVICE_ID_APPLE_MAGICTRACKPAD2 &&
+	    (id->product == USB_DEVICE_ID_APPLE_MAGICTRACKPAD2 ||
+	     id->product == USB_DEVICE_ID_APPLE_MAGICMOUSE2) &&
 	    hdev->type != HID_TYPE_USBMOUSE)
 		return 0;
 
@@ -864,6 +978,8 @@ static int magicmouse_probe(struct hid_device *hdev,
 	}
 
 	msc->scroll_accel = SCROLL_ACCEL_DEFAULT;
+	msc->hdev = hdev;
+	INIT_DEFERRABLE_WORK(&msc->work, magicmouse_enable_mt_work);
 
 	msc->quirks = id->driver_data;
 	hid_set_drvdata(hdev, msc);
@@ -886,20 +1002,19 @@ static int magicmouse_probe(struct hid_device *hdev,
 		goto err_stop_hw;
 	}
 
+	ret = magicmouse_battery_probe(hdev);
+	if (ret) {
+		hid_err(hdev, "battery not registered\n");
+		goto err_stop_hw;
+	}
+
 	if (id->product == USB_DEVICE_ID_APPLE_MAGICMOUSE)
 		report = hid_register_report(hdev, HID_INPUT_REPORT,
 			MOUSE_REPORT_ID, 0);
+	else if (id->product == USB_DEVICE_ID_APPLE_MAGICMOUSE2)
+		report = hid_register_report(hdev, HID_INPUT_REPORT,
+			MOUSE2_REPORT_ID, 0);
 	else if (id->product == USB_DEVICE_ID_APPLE_MAGICTRACKPAD2) {
-		ret = magicmouse_battery_probe(hdev);
-		if (ret) {
-			hid_err(hdev, "magic trackpad 2 battery not registered\n");
-			/*
-			 * Ignore this error. There is not need to stop the
-			 * device because it will work without reporting its
-			 * battery status.
-			 */
-		}
-
 		if (id->vendor == BT_VENDOR_ID_APPLE)
 			report = hid_register_report(hdev, HID_INPUT_REPORT,
 				TRACKPAD2_BT_REPORT_ID, 0);
@@ -920,25 +1035,6 @@ static int magicmouse_probe(struct hid_device *hdev,
 	}
 	report->size = 6;
 
-	if (id->product == USB_DEVICE_ID_APPLE_MAGICTRACKPAD2) {
-		if (id->vendor == BT_VENDOR_ID_APPLE) {
-			feature_size = sizeof(feature_mt_trackpad2_bt);
-			feature = feature_mt_trackpad2_bt;
-		} else { /* USB_VENDOR_ID_APPLE */
-			feature_size = sizeof(feature_mt_trackpad2_usb);
-			feature = feature_mt_trackpad2_usb;
-		}
-	} else {
-		feature_size = sizeof(feature_mt);
-		feature = feature_mt;
-	}
-
-	buf = kmemdup(feature, feature_size, GFP_KERNEL);
-	if (!buf) {
-		ret = -ENOMEM;
-		goto err_stop_hw;
-	}
-
 	/*
 	 * Some devices repond with 'invalid report id' when feature
 	 * report switching it into multitouch mode is sent to it.
@@ -947,12 +1043,13 @@ static int magicmouse_probe(struct hid_device *hdev,
 	 * but there seems to be no other way of switching the mode.
 	 * Thus the super-ugly hacky success check below.
 	 */
-	ret = hid_hw_raw_request(hdev, buf[0], buf, feature_size,
-				HID_FEATURE_REPORT, HID_REQ_SET_REPORT);
-	kfree(buf);
-	if (ret != -EIO && ret != feature_size) {
+	ret = magicmouse_enable_multitouch(hdev);
+	if (ret != -EIO && ret < 0) {
 		hid_err(hdev, "unable to request touch data (%d)\n", ret);
 		goto err_stop_hw;
+	}
+	if (ret == -EIO && id->product == USB_DEVICE_ID_APPLE_MAGICMOUSE2) {
+		schedule_delayed_work(&msc->work, msecs_to_jiffies(500));
 	}
 
 	return 0;
@@ -966,12 +1063,10 @@ static void magicmouse_remove(struct hid_device *hdev)
 	struct magicmouse_sc *msc = hid_get_drvdata(hdev);
 	struct usb_interface *iface;
 	struct usb_device *usbdev;
-
-	hid_hw_stop(hdev);
+	cancel_delayed_work_sync(&msc->work);
 
 	if (msc &&
-	    msc->input->id.product == USB_DEVICE_ID_APPLE_MAGICTRACKPAD2 &&
-	    msc->input->id.vendor == USB_VENDOR_ID_APPLE &&
+	    magicmouse_can_report_battery_vendor(msc, USB_VENDOR_ID_APPLE) &&
 	    msc->battery.urb && msc->battery.urb_buf) {
 		iface = to_usb_interface(hdev->dev.parent);
 		usbdev = interface_to_usbdev(iface);
@@ -984,11 +1079,17 @@ static void magicmouse_remove(struct hid_device *hdev)
 
 		usb_free_urb(msc->battery.urb);
 	}
+
+	hid_hw_stop(hdev);
 }
 
 static const struct hid_device_id magic_mice[] = {
 	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_APPLE,
 		USB_DEVICE_ID_APPLE_MAGICMOUSE), .driver_data = 0 },
+	{ HID_BLUETOOTH_DEVICE(BT_VENDOR_ID_APPLE,
+		USB_DEVICE_ID_APPLE_MAGICMOUSE2), .driver_data = 0 },
+	{ HID_USB_DEVICE(USB_VENDOR_ID_APPLE,
+		USB_DEVICE_ID_APPLE_MAGICMOUSE2), .driver_data = 0 },
 	{ HID_BLUETOOTH_DEVICE(USB_VENDOR_ID_APPLE,
 		USB_DEVICE_ID_APPLE_MAGICTRACKPAD), .driver_data = 0 },
 	{ HID_BLUETOOTH_DEVICE(BT_VENDOR_ID_APPLE,
@@ -1003,10 +1104,11 @@ static struct hid_driver magicmouse_driver = {
 	.name = "magicmouse",
 	.id_table = magic_mice,
 	.probe = magicmouse_probe,
+	.remove = magicmouse_remove,
 	.raw_event = magicmouse_raw_event,
+	.event = magicmouse_event,
 	.input_mapping = magicmouse_input_mapping,
 	.input_configured = magicmouse_input_configured,
-	.remove	= magicmouse_remove,
 };
 module_hid_driver(magicmouse_driver);
 
