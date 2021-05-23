@@ -2,7 +2,7 @@
 
 root = true
 
-[*.{c,h}]
+[*.{c,h,patch}]
 charset = utf-8
 end_of_line = lf
 indent_size = 8
