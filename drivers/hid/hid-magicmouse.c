@@ -969,7 +969,7 @@ static int magicmouse_probe(struct hid_device *hdev,
 	    (id->product == USB_DEVICE_ID_APPLE_MAGICTRACKPAD2 ||
 	     id->product == USB_DEVICE_ID_APPLE_MAGICMOUSE2) &&
 	    hdev->type != HID_TYPE_USBMOUSE)
-		return 0;
+		return -ENODEV;
 
 	msc = devm_kzalloc(&hdev->dev, sizeof(*msc), GFP_KERNEL);
 	if (msc == NULL) {
